@@ -95,18 +95,18 @@ class Spinner:
     def update(
         self,
         *,
-        text: "RenderableType" = "",
+        text: Optional["RenderableType"] = None,
         style: Optional["StyleType"] = None,
         speed: Optional[float] = None,
     ) -> None:
         """Updates attributes of a spinner after it has been started.
 
         Args:
-            text (RenderableType, optional): A renderable to display at the right of the spinner (str or Text typically). Defaults to "".
+            text (RenderableType, optional): A renderable to display at the right of the spinner (str or Text typically), or None to leave unchanged. Defaults to None.
             style (StyleType, optional): Style for spinner animation. Defaults to None.
             speed (float, optional): Speed factor for animation. Defaults to None.
         """
-        if text:
+        if text is not None:
             self.text = Text.from_markup(text) if isinstance(text, str) else text
         if style:
             self.style = style

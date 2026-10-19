@@ -2,7 +2,9 @@
 
 import io
 import os
+import re
 import tempfile
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -29,6 +31,8 @@ from rich.progress import (
     _TrackThread,
     track,
 )
+from rich.measure import Measurement
+from rich.panel import Panel
 from rich.progress_bar import ProgressBar
 from rich.text import Text
 
@@ -682,6 +686,271 @@ def test_task_progress_column_speed() -> None:
 
     speed_text = TaskProgressColumn.render_speed(8888888)
     assert speed_text.plain == "8.9×10⁶ it/s"
+
+
+def _render_console(width=80, color_system="standard", record=False):
+    return Console(
+        file=io.StringIO(),
+        force_terminal=True,
+        width=width,
+        color_system=color_system,
+        legacy_windows=False,
+        _environ={},
+        record=record,
+    )
+
+
+def test_renderable_description_preserves_style_and_newlines() -> None:
+    console = _render_console(width=80, color_system=None)
+    progress = Progress(
+        TextColumn("[progress.description]{task.description}"),
+        console=console,
+        auto_refresh=False,
+    )
+    task_id = progress.add_task(
+        Text("first line\nsecond line", style="magenta"), total=100
+    )
+    progress.update(task_id, completed=50)
+    console.print(progress)
+    result = console.file.getvalue()
+    assert "first line" in result
+    assert "second line" in result
+    assert result.index("second line") > result.index("first line")
+
+
+def test_renderable_description_ansi_style() -> None:
+    console = _render_console()
+    progress = Progress(
+        TextColumn("{task.description}"), console=console, auto_refresh=False
+    )
+    progress.add_task(Text("styled", style="bold magenta"))
+    console.print(progress)
+    result = console.file.getvalue()
+    assert "\x1b[1;35mstyled\x1b[0m" in result
+
+
+def test_renderable_field() -> None:
+    console = _render_console()
+    progress = Progress(
+        TextColumn("{task.description}: {task.fields[note]}"),
+        console=console,
+        auto_refresh=False,
+    )
+    progress.add_task("task", note=Text("rich note", style="bold red"))
+    console.print(progress)
+    result = console.file.getvalue()
+    assert "task: " in result
+    assert "\x1b[1;31mrich note\x1b[0m" in result
+
+
+def test_multiple_renderable_fields_stay_on_one_line() -> None:
+    console = _render_console()
+    progress = Progress(
+        TextColumn("{task.description}|{task.fields[a]}|{task.fields[b]}"),
+        console=console,
+        auto_refresh=False,
+    )
+    progress.add_task(
+        Text("x1"), a=Text("a1", style="red"), b=Text("b1", style="blue")
+    )
+    console.print(progress)
+    result = console.file.getvalue()
+    # All three renderable pieces flow inline on a single line.
+    assert result.splitlines() == ["x1|\x1b[31ma1\x1b[0m|\x1b[34mb1\x1b[0m"]
+
+
+def test_renderable_field_update() -> None:
+    console = _render_console()
+    progress = Progress(
+        TextColumn("{task.description} {task.fields[x]}"),
+        console=console,
+        auto_refresh=False,
+    )
+    task_id = progress.add_task("task", x="one")
+    console.print(progress)
+    progress.update(task_id, x=Text("two", style="blue"))
+    console.file = io.StringIO()
+    console.print(progress)
+    result = console.file.getvalue()
+    assert "one" not in result
+    assert "\x1b[34mtwo\x1b[0m" in result
+
+
+def test_string_field_markup_unchanged() -> None:
+    # markup enabled (default): square brackets in string values keep their
+    # current markup meaning.
+    console = _render_console()
+    progress = Progress(
+        TextColumn("{task.fields[x]}"), console=console, auto_refresh=False
+    )
+    progress.add_task("task", x="[bold]hi[/bold]")
+    console.print(progress)
+    assert "\x1b[1mhi\x1b[0m" in console.file.getvalue()
+
+    # markup disabled: square brackets are literal text.
+    console = _render_console()
+    progress = Progress(
+        TextColumn("{task.fields[x]}", markup=False),
+        console=console,
+        auto_refresh=False,
+    )
+    progress.add_task("task", x="not [bold]bold")
+    console.print(progress)
+    result = console.file.getvalue()
+    assert "not [bold]bold\n" == result
+
+
+def test_renderable_style_takes_precedence_over_template() -> None:
+    console = _render_console()
+    progress = Progress(
+        TextColumn("[red]{task.description}[/red]"),
+        console=console,
+        auto_refresh=False,
+    )
+    progress.add_task(Text("mine", style="bold blue"))
+    console.print(progress)
+    result = console.file.getvalue()
+    # Object style wins where template style and object style overlap.
+    assert "\x1b[1;34mmine\x1b[0m" in result
+    assert "31" not in result
+
+
+def test_renderable_width_by_cell_width() -> None:
+    console = _render_console()
+    progress = Progress(
+        TextColumn("[bold]{task.description}[/bold]"),
+        console=console,
+        auto_refresh=False,
+    )
+    progress.add_task("中文字😀x")
+    rendered = progress.get_renderable()
+    measurement = Measurement.get(console, console.options, rendered)
+    # full-width characters and emoji count as 2 cells; [bold] tags don't count
+    assert measurement.maximum == 9
+
+
+def test_renderable_description_reflow_on_update() -> None:
+    console = _render_console(width=40, color_system=None)
+    progress = Progress(
+        TextColumn("{task.description}"), console=console, auto_refresh=False
+    )
+    task_id = progress.add_task(Text("a much longer description"))
+    console.print(progress)
+    assert "a much longer description" in console.file.getvalue()
+
+    # Shrink: the new frame contains no remnant of the old, longer text.
+    progress.update(task_id, description=Text("short"))
+    console.file = io.StringIO()
+    console.print(progress)
+    result = console.file.getvalue()
+    assert "short\n" == result
+    assert "longer" not in result
+
+    # Grow: width follows the new content.
+    progress.update(task_id, description=Text("an even longer description again"))
+    console.file = io.StringIO()
+    console.print(progress)
+    result = console.file.getvalue()
+    assert "an even longer description again" in result
+    assert "short" not in result
+
+
+def test_renderable_description_exports() -> None:
+    console = _render_console(width=60, color_system="truecolor", record=True)
+    progress = Progress(
+        TextColumn("{task.description}"), console=console, auto_refresh=False
+    )
+    progress.add_task(Text("styled desc", style="bold magenta"))
+    console.print(progress)
+    html = console.export_html(clear=False)
+    svg = console.export_svg(clear=False)
+    text = console.export_text(styles=True)
+    assert "styled desc" in text
+    assert "\x1b[1;35mstyled desc\x1b[0m" in text
+    assert "font-weight: bold" in html
+    assert "#800080" in html
+    assert "<svg" in svg
+    assert "styled" in svg and "desc" in svg
+
+
+def test_renderable_description_jupyter() -> None:
+    console = _render_console(color_system=None)
+    progress = Progress(
+        TextColumn("{task.description}"), console=console, auto_refresh=False
+    )
+    progress.add_task(Text("jupyter text", style="magenta"))
+    bundle = progress._repr_mimebundle_(None, None)
+    assert "jupyter text" in bundle["text/plain"]
+    assert "jupyter text" in bundle["text/html"]
+
+
+def test_block_renderable_description() -> None:
+    console = _render_console(width=40, color_system=None)
+    progress = Progress(
+        TextColumn("{task.description}"), console=console, auto_refresh=False
+    )
+    progress.add_task(Panel(Text("inside panel", style="yellow")))
+    console.print(progress)
+    result = console.file.getvalue()
+    assert "inside panel" in result
+    assert "╭" in result and "╰" in result
+
+
+def test_concurrent_update_renders_consistent_description_and_fields() -> None:
+    console = _render_console(width=200, color_system=None)
+    progress = Progress(
+        TextColumn("{task.description}|{task.fields[a]}|{task.fields[b]}"),
+        console=console,
+        auto_refresh=False,
+    )
+    task_id = progress.add_task(Text("x0"), a=Text("a0"), b=Text("b0"))
+    stop = threading.Event()
+    errors = []
+    line_pattern = re.compile(r"^x(\d+)\|a(\d+)\|b(\d+)$")
+
+    def updater():
+        i = 0
+        while not stop.is_set():
+            progress.update(
+                task_id,
+                description=Text(f"x{i}"),
+                a=Text(f"a{i}"),
+                b=Text(f"b{i}"),
+            )
+            i += 1
+
+    def checker():
+        while not stop.is_set():
+            snapshot = progress.get_renderable()
+            captured = io.StringIO()
+            check_console = Console(
+                file=captured,
+                force_terminal=True,
+                width=200,
+                color_system=None,
+                legacy_windows=False,
+                _environ={},
+            )
+            check_console.print(snapshot)
+            for line in captured.getvalue().splitlines():
+                match = line_pattern.match(line.strip())
+                if match is None:
+                    errors.append(f"unmatched line: {line!r}")
+                    return
+                d, a, b = (int(group) for group in match.groups())
+                if not (d == a == b):
+                    errors.append(f"split update: {line!r}")
+                    return
+
+    threads = [threading.Thread(target=updater) for _ in range(4)]
+    threads += [threading.Thread(target=checker) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    threading.Event().wait(1.0)
+    stop.set()
+    for thread in threads:
+        thread.join()
+    assert not errors, errors
 
 
 if __name__ == "__main__":

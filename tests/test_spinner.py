@@ -70,3 +70,14 @@ def test_spinner_markup():
     spinner = Spinner("dots", "[bold]spinning[/bold]")
     assert isinstance(spinner.text, Text)
     assert str(spinner.text) == "spinning"
+
+
+def test_spinner_update_falsy_renderable():
+    spinner = Spinner("dots", "Foo")
+    # An explicit (falsy) renderable replaces the existing text.
+    spinner.update(text=Text(""))
+    assert isinstance(spinner.text, Text)
+    assert str(spinner.text) == ""
+    # No text argument (None) leaves the text unchanged.
+    spinner.update(speed=2.0)
+    assert str(spinner.text) == ""

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import string
 import typing
 import warnings
 from abc import ABC, abstractmethod
@@ -40,14 +41,20 @@ if TYPE_CHECKING:
     # Can be replaced with `from typing import Self` in Python 3.11+
     from typing_extensions import Self  # pragma: no cover
 
+    from .console import ConsoleOptions, RenderResult
+
 from . import filesize, get_console
+from ._loop import loop_last
 from .console import Console, Group, JustifyMethod, RenderableType
 from .highlighter import Highlighter
 from .jupyter import JupyterMixin
 from .live import Live
+from .measure import Measurement
 from .progress_bar import ProgressBar
+from .protocol import is_renderable
+from .segment import Segment
 from .spinner import Spinner
-from .style import StyleType
+from .style import Style, StyleType
 from .table import Column, Table
 from .text import Text, TextType
 
@@ -103,7 +110,7 @@ class _TrackThread(Thread):
 
 def track(
     sequence: Iterable[ProgressType],
-    description: str = "Working...",
+    description: RenderableType = "Working...",
     total: Optional[float] = None,
     completed: int = 0,
     auto_refresh: bool = True,
@@ -125,7 +132,8 @@ def track(
 
     Args:
         sequence (Iterable[ProgressType]): Values you wish to iterate over and track progress.
-        description (str, optional): Description of task show next to progress bar. Defaults to "Working".
+        description (RenderableType, optional): Description of task show next to progress bar. May be
+            a str or any Rich renderable. Defaults to "Working".
         total: (float, optional): Total number of steps. Default is len(sequence).
         completed (int, optional): Number of steps completed so far. Defaults to 0.
         auto_refresh (bool, optional): Automatic refresh, disable to force a refresh after each iteration. Default is True.
@@ -307,7 +315,7 @@ def wrap_file(
     file: BinaryIO,
     total: int,
     *,
-    description: str = "Reading...",
+    description: RenderableType = "Reading...",
     auto_refresh: bool = True,
     console: Optional[Console] = None,
     transient: bool = False,
@@ -324,7 +332,8 @@ def wrap_file(
     Args:
         file (Union[str, PathLike[str], BinaryIO]): The path to the file to read, or a file-like object in binary mode.
         total (int): Total number of bytes to read.
-        description (str, optional): Description of task show next to progress bar. Defaults to "Reading".
+        description (RenderableType, optional): Description of task show next to progress bar. May be
+            a str or any Rich renderable. Defaults to "Reading".
         auto_refresh (bool, optional): Automatic refresh, disable to force a refresh after each iteration. Default is True.
         transient: (bool, optional): Clear the progress on exit. Defaults to False.
         console (Console, optional): Console to write to. Default creates internal Console instance.
@@ -378,7 +387,7 @@ def open(
     newline: Optional[str] = None,
     *,
     total: Optional[int] = None,
-    description: str = "Reading...",
+    description: RenderableType = "Reading...",
     auto_refresh: bool = True,
     console: Optional[Console] = None,
     transient: bool = False,
@@ -403,7 +412,7 @@ def open(
     newline: Optional[str] = None,
     *,
     total: Optional[int] = None,
-    description: str = "Reading...",
+    description: RenderableType = "Reading...",
     auto_refresh: bool = True,
     console: Optional[Console] = None,
     transient: bool = False,
@@ -427,7 +436,7 @@ def open(
     newline: Optional[str] = None,
     *,
     total: Optional[int] = None,
-    description: str = "Reading...",
+    description: RenderableType = "Reading...",
     auto_refresh: bool = True,
     console: Optional[Console] = None,
     transient: bool = False,
@@ -613,6 +622,227 @@ class SpinnerColumn(ProgressColumn):
         return text
 
 
+_RENDERABLE_MARKER_FIRST = 0xE000
+_RENDERABLE_MARKER_LAST = 0xF8FF
+
+_formatter = string.Formatter()
+
+
+class _RenderableFormat:
+    """The result of rendering a :class:`TextColumn` template when one or more
+    field values are renderables rather than plain strings.
+
+    Text portions retain the usual markup / highlighting behaviour, while
+    renderable portions are rendered as themselves (rather than being
+    stringified). Template styles are applied as *base* styles to the
+    renderable segments, so any style defined by the renderable itself takes
+    precedence where the two overlap.
+    """
+
+    def __init__(
+        self,
+        pieces: List[Tuple[bool, Any, Any]],
+        justify: JustifyMethod = "left",
+    ) -> None:
+        # Each piece is ``(is_renderable, payload, styles)``.
+        # For text pieces, *payload* is a Text and *styles* is None;
+        # for renderable pieces, *payload* is any renderable and *styles* is a
+        # list of styles contributed by the surrounding template.
+        self._pieces = pieces
+        self._justify = justify
+
+    def __rich_console__(
+        self, console: Console, options: "ConsoleOptions"
+    ) -> "RenderResult":
+        segment_list: List[Segment] = []
+        render = console.render
+        # Pieces must flow inline, so don't let each one justify itself to the
+        # full cell width (which would pad it with spaces); the composite
+        # aligns complete lines further below.
+        piece_options = options.update(justify="default")
+        for piece_is_renderable, payload, styles in self._pieces:
+            segments = list(render(payload, piece_options))
+            # Renderables such as Text append their own (default "\n") ending.
+            # That ending belongs between top level renderables (e.g. separate
+            # print calls), not between pieces of a single inline cell; only
+            # new lines genuinely inside a piece are retained.
+            while segments and segments[-1].text == "\n":
+                segments.pop()
+            if piece_is_renderable and styles:
+                base_style = Style.combine(
+                    [
+                        console.get_style(piece_style, default=Style.null())
+                        for piece_style in styles
+                    ]
+                )
+                segments = list(Segment.apply_style(segments, base_style))
+            segment_list.extend(segments)
+
+        width = options.max_width
+        lines = list(
+            Segment.split_and_crop_lines(
+                segment_list, width, include_new_lines=False, pad=False
+            )
+        )
+        justify = self._justify or options.justify or "left"
+        new_line = Segment.line()
+        for last, line in loop_last(lines):
+            if justify == "right":
+                line_length = Segment.get_line_length(line)
+                if line_length < width:
+                    line = [Segment(" " * (width - line_length)), *line]
+            elif justify == "center":
+                line_length = Segment.get_line_length(line)
+                if line_length < width:
+                    pad_left = (width - line_length) // 2
+                    line = [Segment(" " * pad_left), *line]
+            yield from line
+            if not last:
+                yield new_line
+
+    def __rich_measure__(
+        self, console: Console, options: "ConsoleOptions"
+    ) -> Measurement:
+        minimum = 0
+        maximum = 0
+        for _, payload, _ in self._pieces:
+            measurement = Measurement.get(console, options, payload)
+            minimum += measurement.minimum
+            maximum += measurement.maximum
+        return (
+            Measurement(minimum, maximum)
+            .normalize()
+            .with_maximum(options.max_width)
+        )
+
+
+def _render_text_format(
+    text_format: str,
+    task: "Task",
+    style: StyleType,
+    justify: JustifyMethod,
+    markup: bool,
+    highlighter: Optional[Highlighter],
+) -> RenderableType:
+    """Render a text column template against a task.
+
+    Field values that are strings (or any other value that isn't a Rich
+    renderable) are formatted in to the template exactly as
+    ``str.format`` would. Field values that are Rich renderables are rendered
+    natively, retaining their own styles and newlines, rather than being
+    converted to a string first.
+
+    Args:
+        text_format: Template in str.format syntax, e.g.
+            ``"[progress.description]{task.description}"``.
+        task: The task to format.
+        style: Base style to apply to the text.
+        justify: Justification method.
+        markup: Whether to parse console markup in the template and string
+            field values.
+        highlighter: Optional highlighter applied to the (non renderable)
+            text.
+    """
+    scalar_parts: List[Optional[str]] = []
+    renderable_values: List[RenderableType] = []
+    has_renderable = False
+    try:
+        for literal, field_name, format_spec, conversion in _formatter.parse(
+            text_format
+        ):
+            scalar_parts.append(literal)
+            if field_name is None:
+                continue
+            value, _ = _formatter.get_field(field_name, [], {"task": task})
+            value = _formatter.convert_field(value, conversion)
+            if is_renderable(value) and not isinstance(value, str):
+                has_renderable = True
+                renderable_values.append(value)
+                scalar_parts.append(None)
+            else:
+                scalar_parts.append(
+                    _formatter.format_field(value, format_spec or "")
+                )
+    except Exception:
+        # Any formatting error falls through to str.format below, which will
+        # raise the same error it always did.
+        has_renderable = False
+
+    if not has_renderable:
+        _text = text_format.format(task=task)
+        if markup:
+            text = Text.from_markup(_text, style=style, justify=justify)
+        else:
+            text = Text(_text, style=style, justify=justify)
+        if highlighter:
+            highlighter.highlight(text)
+        return text
+
+    # Select single-character placeholders that don't occur in the scalar
+    # content, so the complete template can be parsed as markup in a single
+    # pass (opening and closing tags remain balanced across a placeholder).
+    scalar_text = "".join(part for part in scalar_parts if part is not None)
+    markers: List[str] = []
+    marker_code = _RENDERABLE_MARKER_FIRST
+    for _ in renderable_values:
+        while (
+            chr(marker_code) in scalar_text
+            and marker_code <= _RENDERABLE_MARKER_LAST
+        ):
+            marker_code += 1
+        markers.append(chr(marker_code))
+        marker_code += 1
+
+    markers_iter = iter(markers)
+    marked_text = "".join(
+        next(markers_iter) if part is None else part for part in scalar_parts
+    )
+
+    if markup:
+        text = Text.from_markup(marked_text, style=style, justify=justify)
+    else:
+        text = Text(marked_text, style=style, justify=justify)
+
+    plain = text.plain
+    # Record the styles the template has in effect at each placeholder, before
+    # the highlighter runs. The renderable's own styles will override these.
+    slots: List[Tuple[int, RenderableType, List[StyleType]]] = []
+    search_start = 0
+    for marker, renderable in zip(markers, renderable_values):
+        offset = plain.find(marker, search_start)
+        active_styles: List[StyleType] = []
+        if text.style:
+            active_styles.append(text.style)
+        for span in text._spans:
+            if span.start <= offset < span.end and span.style:
+                active_styles.append(span.style)
+        slots.append((offset, renderable, active_styles))
+        search_start = offset + 1
+
+    if highlighter:
+        highlighter.highlight(text)
+
+    # Divide the parsed text around the placeholders, discarding the
+    # placeholder characters themselves.
+    boundaries = [
+        boundary for offset, _, _ in slots for boundary in (offset, offset + 1)
+    ]
+    divided = text.divide(boundaries)
+
+    pieces: List[Tuple[bool, Any, Any]] = []
+    for index, piece_text in enumerate(divided):
+        if index % 2:
+            _, renderable, active_styles = slots[index // 2]
+            pieces.append((True, renderable, active_styles))
+        elif len(piece_text):
+            # The pieces flow inline, so they must not justify themselves or
+            # emit their own line endings; the composite aligns whole lines.
+            piece_text.justify = None
+            piece_text.end = ""
+            pieces.append((False, piece_text, None))
+    return _RenderableFormat(pieces, justify=justify)
+
+
 class TextColumn(ProgressColumn):
     """A column containing text."""
 
@@ -632,15 +862,15 @@ class TextColumn(ProgressColumn):
         self.highlighter = highlighter
         super().__init__(table_column=table_column or Column(no_wrap=True))
 
-    def render(self, task: "Task") -> Text:
-        _text = self.text_format.format(task=task)
-        if self.markup:
-            text = Text.from_markup(_text, style=self.style, justify=self.justify)
-        else:
-            text = Text(_text, style=self.style, justify=self.justify)
-        if self.highlighter:
-            self.highlighter.highlight(text)
-        return text
+    def render(self, task: "Task") -> RenderableType:
+        return _render_text_format(
+            self.text_format,
+            task,
+            self.style,
+            self.justify,
+            self.markup,
+            self.highlighter,
+        )
 
 
 class BarColumn(ProgressColumn):
@@ -753,20 +983,20 @@ class TaskProgressColumn(TextColumn):
         data_speed = speed / unit
         return Text(f"{data_speed:.1f}{suffix} it/s", style="progress.percentage")
 
-    def render(self, task: "Task") -> Text:
+    def render(self, task: "Task") -> RenderableType:
         if task.total is None and self.show_speed:
             return self.render_speed(task.finished_speed or task.speed)
         text_format = (
             self.text_format_no_percentage if task.total is None else self.text_format
         )
-        _text = text_format.format(task=task)
-        if self.markup:
-            text = Text.from_markup(_text, style=self.style, justify=self.justify)
-        else:
-            text = Text(_text, style=self.style, justify=self.justify)
-        if self.highlighter:
-            self.highlighter.highlight(text)
-        return text
+        return _render_text_format(
+            text_format,
+            task,
+            self.style,
+            self.justify,
+            self.markup,
+            self.highlighter,
+        )
 
 
 class TimeRemainingColumn(ProgressColumn):
@@ -943,8 +1173,8 @@ class Task:
     id: TaskID
     """Task ID associated with this task (used in Progress methods)."""
 
-    description: str
-    """str: Description of the task."""
+    description: RenderableType
+    """RenderableType: Description of the task (a str or any Rich renderable)."""
 
     total: Optional[float]
     """Optional[float]: Total number of steps in this task."""
@@ -1195,7 +1425,7 @@ class Progress(JupyterMixin):
         total: Optional[float] = None,
         completed: int = 0,
         task_id: Optional[TaskID] = None,
-        description: str = "Working...",
+        description: RenderableType = "Working...",
         update_period: float = 0.1,
     ) -> Iterable[ProgressType]:
         """Track progress by iterating over a sequence.
@@ -1207,7 +1437,8 @@ class Progress(JupyterMixin):
             total: (float, optional): Total number of steps. Default is len(sequence).
             completed (int, optional): Number of steps completed so far. Defaults to 0.
             task_id: (TaskID): Task to track. Default is new task.
-            description: (str, optional): Description of task, if new task is created.
+            description: (RenderableType, optional): Description of task (str or any Rich
+                renderable), if new task is created.
             update_period (float, optional): Minimum time (in seconds) between calls to update(). Defaults to 0.1.
 
         Returns:
@@ -1240,7 +1471,7 @@ class Progress(JupyterMixin):
         total: Optional[int] = None,
         *,
         task_id: Optional[TaskID] = None,
-        description: str = "Reading...",
+        description: RenderableType = "Reading...",
     ) -> BinaryIO:
         """Track progress file reading from a binary file.
 
@@ -1288,7 +1519,7 @@ class Progress(JupyterMixin):
         *,
         total: Optional[int] = None,
         task_id: Optional[TaskID] = None,
-        description: str = "Reading...",
+        description: RenderableType = "Reading...",
     ) -> BinaryIO:
         pass
 
@@ -1304,7 +1535,7 @@ class Progress(JupyterMixin):
         *,
         total: Optional[int] = None,
         task_id: Optional[TaskID] = None,
-        description: str = "Reading...",
+        description: RenderableType = "Reading...",
     ) -> TextIO:
         pass
 
@@ -1319,7 +1550,7 @@ class Progress(JupyterMixin):
         *,
         total: Optional[int] = None,
         task_id: Optional[TaskID] = None,
-        description: str = "Reading...",
+        description: RenderableType = "Reading...",
     ) -> Union[BinaryIO, TextIO]:
         """Track progress while reading from a binary file.
 
@@ -1421,7 +1652,7 @@ class Progress(JupyterMixin):
         total: Optional[float] = None,
         completed: Optional[float] = None,
         advance: Optional[float] = None,
-        description: Optional[str] = None,
+        description: Optional[RenderableType] = None,
         visible: Optional[bool] = None,
         refresh: bool = False,
         **fields: Any,
@@ -1433,7 +1664,9 @@ class Progress(JupyterMixin):
             total (float, optional): Updates task.total if not None.
             completed (float, optional): Updates task.completed if not None.
             advance (float, optional): Add a value to task.completed if not None.
-            description (str, optional): Change task description if not None.
+            description (RenderableType, optional): Change task description if not None. May be
+                a str or any Rich renderable. Field values given as keyword arguments may also
+                be str or any Rich renderable.
             visible (bool, optional): Set visible flag if not None.
             refresh (bool): Force a refresh of progress information. Default is False.
             **fields (Any): Additional data fields required for rendering.
@@ -1483,7 +1716,7 @@ class Progress(JupyterMixin):
         total: Optional[float] = None,
         completed: int = 0,
         visible: Optional[bool] = None,
-        description: Optional[str] = None,
+        description: Optional[RenderableType] = None,
         **fields: Any,
     ) -> None:
         """Reset a task so completed is 0 and the clock is reset.
@@ -1494,7 +1727,8 @@ class Progress(JupyterMixin):
             total (float, optional): New total steps in task, or None to use current total. Defaults to None.
             completed (int, optional): Number of steps completed. Defaults to 0.
             visible (bool, optional): Set visible flag if not None.
-            description (str, optional): Change task description if not None. Defaults to None.
+            description (RenderableType, optional): Change task description if not None. May be
+                a str or any Rich renderable. Defaults to None.
             **fields (str): Additional data fields required for rendering.
         """
         current_time = self.get_time()
@@ -1551,7 +1785,12 @@ class Progress(JupyterMixin):
 
     def get_renderable(self) -> RenderableType:
         """Get a renderable for the progress display."""
-        renderable = Group(*self.get_renderables())
+        # Materialize under the lock so a description or field can't change
+        # half way through building the render (e.g. from another thread
+        # calling update).
+        with self._lock:
+            renderables = list(self.get_renderables())
+        renderable = Group(*renderables)
         return renderable
 
     def get_renderables(self) -> Iterable[RenderableType]:
@@ -1599,7 +1838,7 @@ class Progress(JupyterMixin):
 
     def add_task(
         self,
-        description: str,
+        description: RenderableType,
         start: bool = True,
         total: Optional[float] = 100.0,
         completed: int = 0,
@@ -1609,7 +1848,7 @@ class Progress(JupyterMixin):
         """Add a new 'task' to the Progress display.
 
         Args:
-            description (str): A description of the task.
+            description (RenderableType): A description of the task (a str or any Rich renderable).
             start (bool, optional): Start the task immediately (to calculate elapsed time). If set to False,
                 you will need to call `start` manually. Defaults to True.
             total (float, optional): Number of total steps in the progress if known.
